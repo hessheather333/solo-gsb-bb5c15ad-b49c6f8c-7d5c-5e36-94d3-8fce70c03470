@@ -7,7 +7,8 @@
 管理写接口（PUT /policies、POST /policies/rollback、POST /policy-changes、
 DELETE /policy-changes/{change_id}）需要 HMAC-SHA256 防重放签名
 （X-Key-Id/X-Timestamp/X-Nonce/X-Signature，见 app/auth.py）；
-所有 GET、POST /decide、POST /decide-batches 裁决与撤销、
+所有 GET、POST /decide、POST /decide-batches 裁决、撤销与
+POST /reservations 预占（创建/确认/取消/查询）、
 POST /policies/impact-preview 预演接口保持匿名可用。
 """
 
@@ -37,6 +38,8 @@ from .schemas import (
     PolicyOut,
     PolicyRollbackIn,
     PolicyVersionOut,
+    ReservationIn,
+    ReservationOut,
     RevokeOut,
 )
 
@@ -61,11 +64,15 @@ app = FastAPI(
         "批次按 batch_id 幂等存档。"
         "POST /policies/impact-preview 在只读快照上预演候选容量/速率对"
         "未来 0～3600 秒请求序列的影响，双侧逐条对比，不落库。"
+        "POST /reservations 提供配额预占：同一事务内整组判足才扣减并保存原"
+        "命中桶，支持确认（仅转 confirmed）、取消（返还 cost）与按 ID 查询；"
+        "pending 预占带 1～300 秒 TTL，所有余额写操作先在事务内把到期预占"
+        "转为 expired 并返还，确认与到期竞争时到期优先。"
         "管理写接口（策略新增/更新、回滚、定时变更创建/取消）需要"
         " HMAC-SHA256 防重放签名（X-Key-Id/X-Timestamp/X-Nonce/X-Signature）；"
-        "GET、裁决（含批量）、预演与撤销接口无需认证。"
+        "GET、裁决（含批量）、预占（创建/确认/取消/查询）、预演与撤销接口无需认证。"
     ),
-    version="1.6.0",
+    version="1.7.0",
     lifespan=lifespan,
 )
 
@@ -401,3 +408,97 @@ def revoke_decision(
     with write_tx(conn):
         result, _duplicate = quota.revoke(conn, request_id)
         return result
+
+
+# ------------------------------------------------------------ 配额预占
+
+
+@app.post(
+    "/reservations",
+    response_model=ReservationOut,
+    tags=["配额预占"],
+    responses={
+        404: {"description": "没有任何命中的已配置配额策略"},
+        409: {"description": "reservation_id 已存在但载荷不一致"},
+    },
+)
+def create_reservation(
+    body: ReservationIn, conn: sqlite3.Connection = Depends(get_conn)
+) -> dict:
+    """创建配额预占（免认证）。
+
+    在同一个 BEGIN IMMEDIATE 事务内：先把到期 pending 预占转为 expired 并
+    返还，再应用命中的到期定时切换；全部命中桶充足才统一扣减 cost 并保存
+    原命中桶，否则一个令牌都不扣（status=rejected）。
+    相同 reservation_id + 相同载荷重放当前结果（replayed=true，不改变
+    余额）；异载荷返回 409。
+    """
+    with write_tx(conn):
+        result, _replayed = quota.create_reservation(
+            conn,
+            reservation_id=body.reservation_id,
+            tenant_id=body.tenant_id,
+            route_id=body.route_id,
+            cost=body.cost,
+            ttl_seconds=body.ttl_seconds,
+        )
+        return result
+
+
+@app.post(
+    "/reservations/{reservation_id}/confirm",
+    response_model=ReservationOut,
+    tags=["配额预占"],
+    responses={
+        404: {"description": "预占不存在"},
+        409: {"description": "预占已到期（到期优先）或处于 confirmed/cancelled/rejected 终态"},
+    },
+)
+def confirm_reservation(
+    reservation_id: str, conn: sqlite3.Connection = Depends(get_conn)
+) -> dict:
+    """确认预占：仅将 pending 转为 confirmed，不再扣减余额。
+
+    事务内先惰性处理到期预占：确认时刻已到期则到期优先（409）。
+    重复确认幂等（replayed=true，余额不变）。
+    """
+    with write_tx(conn):
+        result, _replayed = quota.confirm_reservation(conn, reservation_id)
+        return result
+
+
+@app.post(
+    "/reservations/{reservation_id}/cancel",
+    response_model=ReservationOut,
+    tags=["配额预占"],
+    responses={
+        404: {"description": "预占不存在"},
+        409: {"description": "预占已到期（到期优先）或处于 confirmed/cancelled/rejected 终态"},
+    },
+)
+def cancel_reservation(
+    reservation_id: str, conn: sqlite3.Connection = Depends(get_conn)
+) -> dict:
+    """取消预占：将 pending 转为 cancelled，并向原命中桶返还 cost。
+
+    返还先按各桶当前策略补充（含到期定时切换），再加回 cost，不超过当前
+    容量。事务内先处理到期预占（到期优先）；重复取消幂等，余额不再改变。
+    """
+    with write_tx(conn):
+        result, _replayed = quota.cancel_reservation(conn, reservation_id)
+        return result
+
+
+@app.get(
+    "/reservations/{reservation_id}",
+    response_model=ReservationOut,
+    tags=["配额预占"],
+    responses={404: {"description": "预占不存在"}},
+)
+def get_reservation(
+    reservation_id: str, conn: sqlite3.Connection = Depends(get_conn)
+) -> dict:
+    """查询预占状态及到期时间；若该预占已到期，本次查询在同一写事务内把它
+    清理为 expired 并向原桶返还（到期状态即查即清）。"""
+    with write_tx(conn):
+        return quota.get_reservation(conn, reservation_id)

@@ -3,6 +3,8 @@
 使用 **Python 3.11 + FastAPI + SQLite** 实现的本地多级配额裁决服务。
 配额策略可分别在 **全局（global）/ 租户（tenant）/ 路由（route）** 三级配置，
 每级独立设置桶容量（capacity）与每秒令牌补充率（refill_rate）。
+除即时裁决外还提供**配额预占（reservation）**：先扣占、后确认/取消，
+带 1～300 秒 TTL，到期由写事务惰性失效并自动返还。
 
 ## 核心语义
 
@@ -42,6 +44,39 @@
   - 与单笔裁决相同，批中某条目没有命中任何已配置策略层级时整批返回 **404**。
 - **撤销**：可撤销已通过的裁决并向当时命中的桶补回令牌，重复撤销保持幂等；
   补回时同样先补充再退还，最终余额**不超过桶容量**。
+- **配额预占（reservation）**：`POST /reservations` 在**同一个
+  `BEGIN IMMEDIATE` 事务、同一时刻**内复用多级桶：先应用命中且到期的定时
+  切换，再对全部命中桶「补充 → 判足」——**全部充足才统一扣减 `cost` 并保存
+  原命中桶**，预占为 `pending`（到期时刻 `expires_at = 创建时刻 + ttl`）；
+  任一桶不足则**一个令牌都不扣**（时间应得的补充仍落库），预占落档为终态
+  `rejected`，响应 `allowed=false`。
+  - **幂等**：相同 `reservation_id` + 相同载荷（tenant_id / route_id /
+    cost / ttl_seconds）重放该预占的当前结果（`replayed=true`，不改变
+    余额）；异载荷返回 **409**。通过与拒绝的预占都会存档。
+  - **确认**：`POST /reservations/{id}/confirm` **仅把 `pending` 转为
+    `confirmed`，不再扣减任何余额**（预占创建时已扣）；重复确认幂等，
+    余额不变。
+  - **取消**：`POST /reservations/{id}/cancel` 转为 `cancelled` 并向
+    **原命中桶**（创建时保存的键集合）**返还 `cost`**；返还先按各桶
+    **当前**策略把时间应得的令牌补充到事务时刻（含到期定时切换），再加回
+    `cost`，最终余额**不超过当前容量**。重复取消幂等，不重复返还。
+  - **惰性到期（无后台任务）**：`pending` 的 TTL 为 **1～300 秒**。
+    **所有余额写操作——预占创建/确认/取消/查询，以及普通裁决、批量裁决与
+    撤销——都在同一事务内先把所有已到期的 pending 批量转为 `expired` 并向原桶
+    返还**，再执行自身逻辑（预占与裁决共享同一套多级桶，到期预占的令牌必须
+    先回来才参与判足/返还）。
+    **确认与到期竞争时以事务内时间为准、到期优先**：确认事务先把到期预占
+    翻成 `expired`，随后对它的确认只能返回 **409** 并已完成返还。
+    `GET /reservations/{id}` 返回当前状态与 `expires_at`，并**即查即清**：
+    若该预占已到期，本次查询在同一写事务把它转为 `expired` 并返还。
+  - **终态机**：`pending` 是唯一活动态；`confirmed` / `cancelled` /
+    `expired` / `rejected` 均为终态。同一终态操作重复调用幂等且**不改变
+    余额**；其他终态间的转换（如 confirmed→cancel、cancelled→confirm、
+    rejected→confirm/cancel、expired→confirm/cancel）一律 **409**；
+    未知 `reservation_id` 返回 **404**。
+  - 预占与普通裁决**共享同一套多级桶**：预占占用期间，裁决只能看到扣减后
+    的余额。预占的扣减与返还**不产生 low_balance 事件**（事件仍只由获准
+    裁决触发）。预占接口与裁决接口一样**免认证**。
 - **低余额事件**：策略可配置 `low_balance_threshold`（`null` 关闭，否则须在
   `0` 到 `capacity` 之间）。一次**获准**裁决若令某命中桶的余额
   **从阈值之上降至不高于阈值**，会在扣减的同一事务内为该桶写入唯一一条
@@ -88,6 +123,7 @@
   `PUT /policies`（策略新增/更新）、`POST /policies/rollback`（回滚）、
   `POST /policy-changes`（定时变更创建）、`DELETE /policy-changes/{change_id}`
   （定时变更取消）。**所有 GET、`POST /decide`、`POST /decide-batches` 裁决、
+`POST /reservations` 预占（创建/确认/取消/查询）、
 `POST /policies/impact-preview` 预演与撤销接口保持原样、无需认证**。
   客户端发送 `X-Key-Id`、`X-Timestamp`（Unix 秒）、`X-Nonce`、`X-Signature` 四个头，
   签名原文为 `方法\n原始路径及查询串\n请求体 SHA-256 十六进制\n时间戳\nnonce`，
@@ -159,6 +195,10 @@ SQLite 数据文件保存在命名卷 `quota-data`（容器内 `/data/quota.db`�
 | `POST` | `/policies/rollback` |
 | `POST` | `/policy-changes` |
 | `DELETE` | `/policy-changes/{change_id}` |
+
+> 预占四接口（`POST /reservations`、`POST /reservations/{id}/confirm`、
+> `POST /reservations/{id}/cancel`、`GET /reservations/{id}`）与裁决接口一致，
+> **无需签名**。
 
 ### 请求头
 
@@ -290,6 +330,10 @@ print(urllib.request.urlopen(req).read().decode())
 | `POST` | `/decide` | 提交一次多级裁决（事务内先应用命中且到期的变更） |
 | `POST` | `/decide-batches` | 一个事务内整批裁决 1～50 个请求（同刻应用到期切换、按序演算共享桶、全获准才落库、batch_id 幂等） |
 | `POST` | `/decide/{request_id}/revoke` | 撤销一次已通过的裁决（含成功批次中的单笔；重复撤销幂等） |
+| `POST` | `/reservations` | 创建配额预占：整组判足才扣减并保存原命中桶（ttl 1～300 秒），不足全不扣（rejected）；同 ID 同载荷重放、异载荷 409 |
+| `POST` | `/reservations/{reservation_id}/confirm` | 确认预占：仅 pending → confirmed，不再扣减；重复确认幂等，终态转换 409 |
+| `POST` | `/reservations/{reservation_id}/cancel` | 取消预占：pending → cancelled 并向原桶返还 cost（先补充、不超当前容量）；重复取消幂等，到期优先 409 |
+| `GET`  | `/reservations/{reservation_id}` | 查询预占状态与到期时间；若已到期则在同一写事务清理为 expired 并返还 |
 | `GET`  | `/events` | 按 id 递增分页查询 low_balance 事件（`after_id` / `limit`） |
 
 策略对象：
@@ -470,6 +514,76 @@ print(urllib.request.urlopen(req).read().decode())
 > 批次内重复）。失败批次同样按 `batch_id` 存档，重放返回同一失败结果且
 > `replayed=true`。空数组、超过 50 项、空 `batch_id`/`request_id`、`cost<=0`、
 > 只给 `route_id` 不给 `tenant_id` 均返回 **422**。
+
+### 配额预占
+
+预占请求（`POST /reservations`，免认证）：
+
+```json
+{
+  "reservation_id": "rsv-20260927-001",
+  "tenant_id": "acme",
+  "route_id": "/v1/search",
+  "cost": 3,
+  "ttl_seconds": 60
+}
+```
+
+> - `tenant_id`、`route_id` 均可省略；省略即不命中对应层级（与裁决一致），
+>   只给 `route_id` 不给 `tenant_id` 返回 **422**；
+> - `cost` 必须为正数（`> 0`），对所有命中桶统一扣减同一数量；
+> - `ttl_seconds` 为整数 **1～300 秒**，越界返回 **422**；
+> - 没有命中任何已配置策略层返回 **404**（不存档）。
+
+预占对象（创建/确认/取消/查询共用同一响应结构）：
+
+```json
+{
+  "reservation_id": "rsv-20260927-001",
+  "allowed": true,
+  "status": "pending",
+  "cost": 3.0,
+  "tenant_id": "acme",
+  "route_id": "/v1/search",
+  "ttl_seconds": 60,
+  "created_at": "2026-09-27T10:00:00.000000Z",
+  "expires_at": "2026-09-27T10:01:00.000000Z",
+  "confirmed_at": null,
+  "cancelled_at": null,
+  "expired_at": null,
+  "replayed": false,
+  "buckets": [
+    {"scope": "global", "tenant_id": null, "route_id": null,
+     "capacity": 10.0, "refill_rate": 0.5, "balance": 7.0}
+  ]
+}
+```
+
+| 字段 | 含义 |
+| --- | --- |
+| `allowed` | 创建时全部命中桶是否充足；`false` 时 `status` 恒为 `rejected`，未扣减任何余额 |
+| `status` | `pending`（预占中）/ `confirmed`（已确认）/ `cancelled`（已取消并返还）/ `expired`（到期失效并返还）/ `rejected`（创建即被拒） |
+| `expires_at` | pending 的到期时刻（创建时刻 + `ttl_seconds`，UTC）；`rejected` 为 `null` |
+| `confirmed_at` / `cancelled_at` / `expired_at` | 进入对应终态的时刻（UTC），未进入为 `null` |
+| `replayed` | 本次是否为相同 `reservation_id` + 相同载荷的幂等重放（重放不再改变余额） |
+| `buckets` | 创建/拒绝：命中桶扣减或补充后余额与当前容量/速率；确认：创建时存档快照；取消/到期：返还后实时余额 |
+
+状态机与状态码：
+
+```
+                 ┌──(confirm)──► confirmed ─┐（终态；重复 confirm 幂等）
+  创建获准 pending ┤
+                 ├──(cancel)───► cancelled ─┤（终态，向原桶返还 cost；重复 cancel 幂等）
+                 └──(TTL 到期)─► expired ───┘（终态，惰性返还；到期优先于 confirm/cancel）
+  创建被拒 ───────────────────► rejected（终态，不扣余额）
+```
+
+| 操作 | 成功 | 幂等重放 | 冲突 |
+| --- | --- | --- | --- |
+| `POST /reservations` | 200（pending 或 rejected） | 200，`replayed=true` | 同 ID 异载荷 **409** |
+| `POST .../confirm` | pending → confirmed | 已 confirmed 再调：200，`replayed=true`，余额不变 | expired（到期优先）/ cancelled / rejected：**409**；未知 ID：**404** |
+| `POST .../cancel` | pending → cancelled（返还） | 已 cancelled 再调：200，`replayed=true`，不重复返还 | expired（到期优先）/ confirmed / rejected：**409**；未知 ID：**404** |
+| `GET .../{id}` | 200（到期则同事务转 expired 并返还） | — | 未知 ID：**404** |
 
 ## 示例请求
 
@@ -886,6 +1000,63 @@ true`，候选侧余额 2.5 不扣减），第 3 条在两侧均获准：
 > - 预演**全程只读**：策略、桶、裁决（`decisions`）与低余额事件均不受影响，
 >   也不产生任何事件；接口免认证。
 
+### 11. 配额预占：扣占、幂等、确认、取消与到期自动返还
+
+预占接口免认证，直接用普通 `curl`。沿用第 1 步配置的全局桶（容量 10）：
+
+```bash
+# 创建预占：整组桶充足 -> 统一扣 3 并保存原命中桶，status=pending（60 秒有效）
+curl -s -X POST http://localhost:8000/reservations \
+  -H 'Content-Type: application/json' \
+  -d '{"reservation_id":"rsv-1","cost":3,"ttl_seconds":60}'
+# {"allowed":true,"status":"pending","expires_at":"...+60s","buckets":[{"balance":7.0}...]}
+
+# 余额已被预占：普通裁决只能看到扣减后的余额
+curl -s -X POST http://localhost:8000/decide \
+  -H 'Content-Type: application/json' -d '{"request_id":"d-hold","cost":8}'
+# {"allowed":false,...}
+
+# 相同 ID + 相同载荷：重放当前结果（replayed=true），不重复扣减
+curl -s -X POST http://localhost:8000/reservations \
+  -H 'Content-Type: application/json' \
+  -d '{"reservation_id":"rsv-1","cost":3,"ttl_seconds":60}'
+# 相同 ID 但载荷不同（如 cost=4）：HTTP 409
+
+# 确认：仅 pending -> confirmed，不再扣减；重复确认幂等（第二次 replayed=true）
+curl -s -X POST http://localhost:8000/reservations/rsv-1/confirm
+curl -s -X POST http://localhost:8000/reservations/rsv-1/confirm
+# 已确认再取消返回 409：
+curl -i -X POST http://localhost:8000/reservations/rsv-1/cancel
+```
+
+取消会向**原命中桶**返还 `cost`（先按当前策略补充，再返还，不超当前容量）：
+
+```bash
+curl -s -X POST http://localhost:8000/reservations \
+  -H 'Content-Type: application/json' \
+  -d '{"reservation_id":"rsv-2","cost":4,"ttl_seconds":60}'
+# balance 10 -> 6
+curl -s -X POST http://localhost:8000/reservations/rsv-2/cancel
+# status=cancelled；balance 回到 10（重复取消幂等，不会再 +4）
+curl -s -X POST http://localhost:8000/reservations/rsv-2/cancel
+```
+
+到期**不需要任何后台动作**：TTL 到点后的第一个预占余额写操作（创建 / 确认 /
+取消 / 查询）会在**同一写事务内**先把到期 pending 转为 `expired` 并返还；
+确认与到期竞争时**以事务内时间为准、到期优先**：
+
+```bash
+# ttl=1：1 秒后不确认也不取消
+curl -s -X POST http://localhost:8000/reservations \
+  -H 'Content-Type: application/json' \
+  -d '{"reservation_id":"rsv-3","cost":5,"ttl_seconds":1}'
+sleep 1.2
+# GET 即查即清：本次查询在同一写事务转 expired 并返还，返回 status=expired
+curl -s http://localhost:8000/reservations/rsv-3
+# 到期后确认/取消均返回 409
+curl -i -X POST http://localhost:8000/reservations/rsv-3/confirm
+```
+
 ## 行为约定与边界
 
 - 桶首次被命中时按当前容量**满额**创建。
@@ -908,6 +1079,7 @@ true`，候选侧余额 2.5 不扣减），第 3 条在两侧均获准：
   version=1 的 `baseline`（幂等），历史策略因此也可直接回滚。
 - 低余额事件只在**获准**裁决的扣减事务内产生：拒绝、幂等重放、
   撤销与策略更新/变更应用本身都不写事件；一次裁决中每个越线桶各写一条。
+  预占的创建扣减与取消/到期返还同样**不产生** low_balance 事件。
 - 阈值判定为「扣减前余额 > 阈值 ≥ 扣减后余额」；余额本就在阈值之下的
   扣减不会重复触发，待余额重新高于阈值后才会再次武装。
 - 若一次裁决没有命中任何已配置的层级，返回 `404`（提示先配置策略）。
@@ -938,6 +1110,30 @@ true`，候选侧余额 2.5 不扣减），第 3 条在两侧均获准：
   - 未命中任何已配置策略层的请求两侧均为准入、`buckets` 为空；
   - 预演是基于「窗口内策略不变、无其他流量」假设的演算，实际裁决仍以
     `POST /decide` 为准。
+- 配额预占（`POST /reservations` 及确认/取消/查询）的额外约定：
+  - 创建与裁决共用同一套惰性多级桶与同一事务模板：事务内先应用命中且到期的
+    定时切换，再「补充 → 判足」；全部命中桶充足才统一扣减 `cost` 并保存原
+    命中桶（`reservation_buckets`，按全局→租户→路由顺序），任一不足则一个
+    令牌都不扣（时间应得的补充仍落库），预占落档为终态 `rejected`；
+  - **所有**预占余额写操作（创建/确认/取消/查询）都在同一 `BEGIN IMMEDIATE`
+    事务的最前面把全部已到期（`expires_at <= 事务时刻`）的 pending 按
+    `(expires_at, reservation_id)` 顺序转为 expired 并返还：先对涉及桶并集
+    一次性应用到期定时切换，再逐桶「按当前策略补充 → 加回 cost → 截断到当前
+    容量」。无后台任务，到期完全由写事务惰性驱动；
+  - 确认只做 `pending → confirmed` 的状态翻转（不扣不返）；确认事务先执行
+    到期清理，故事务时刻已到期的预占对确认表现为 expired，返回 409
+    （到期优先）。取消做 `pending → cancelled` 并返还，同样到期优先；
+  - 同一终态操作重复调用幂等：重复 confirm / cancel 返回上一次结果
+    （`replayed=true`）且**不再次改变余额**（cancel 不重复返还）；其他终态
+    间转换（confirmed↔cancelled、对 expired/rejected 的确认或取消）返回 409；
+  - `reservation_id` 对完整载荷（tenant_id / route_id / cost / ttl_seconds）
+    幂等：同键同载荷重放该预占的**当前**结果（恰好在期时会先被惰性到期清理，
+    故重放也可能观察到 expired），同键异载荷返回 409；通过与拒绝的预占都存档；
+  - 查询接口返回当前状态与 `expires_at`，并承担「即查即清」：查询本身运行在
+    写事务中，若该预占已到期，会在同一事务完成 expired 翻转与返还；
+  - `cost <= 0`、`ttl_seconds` 非 1～300 整数、只给 `route_id` 不给
+    `tenant_id`、空 `reservation_id` 返回 422；未命中任何策略层返回 404；
+  - 预占占用与普通/批量裁决共享桶余额；预占创建/确认/取消/查询均免认证。
 
 ## 本地开发（不用 Docker）
 
@@ -951,7 +1147,7 @@ QUOTA_DB_PATH=./quota.db \
 ```
 
 > 不设置 `ADMIN_KEY_ID` / `ADMIN_HMAC_SECRET` 时，四个管理写接口返回 503；
-> GET / 裁决 / 撤销仍可正常使用。
+> GET / 裁决 / 预占 / 撤销仍可正常使用。
 
 运行测试（另需 `pip install pytest httpx`）：
 
@@ -992,19 +1188,26 @@ nonce 同 key 重用 409 与过期清理后可复用、按 key 隔离、
 策略影响预演覆盖：双侧逐条准入与余额差异、起点余额截断到候选容量、
 按 at_seconds 分侧补充、拒绝不扣减且前项影响后项、多级共享桶发散、
 只读不改策略/桶/裁决/事件、目标策略 404、命中 pending 变更 409、
-at_seconds 越界与递减等 422、未命中策略层的请求两侧准入、免认证。
+at_seconds 越界与递减等 422、未命中策略层的请求两侧准入、免认证；
+配额预占覆盖：多级整组扣占与不足全不扣（rejected）、预占与裁决共享桶、
+幂等重放（含到期后重放观察到 expired）与异载荷 409、确认仅转状态不扣减且
+重复确认幂等、取消返还原桶且重复取消不重复返还、TTL 到期惰性返还（查询即查
+即清/下一写事务批量清理）、确认与到期竞争到期优先、终态间转换 409 与未知 ID
+404、返还先补充并沿定时切换规则且不超当前容量、cost/ttl/route 等 422 与无策略
+404、不产生 low_balance 事件、20 线程并发不超发、确认/到期并发下终态与余额
+一致、四接口免认证。
 
 ## 项目结构
 
 ```
 app/
   auth.py       # 管理写接口 HMAC-SHA256 防重放：签名校验（常量时间比较）、时间窗与 nonce 登记
-  database.py   # SQLite 连接、WAL/busy_timeout、BEGIN IMMEDIATE 写事务 / 只读快照事务、建表（含 admin_nonces、decide_batches）与老库迁移（含 baseline 版本补登）
-  quota.py      # 策略 upsert、版本审计/回滚、定时切换登记/取消/到期应用、惰性补充、整组裁决、批量裁决（同刻切换+按序共享桶+全获准才落库+批次幂等存档）、策略影响预演（只读快照+现行/候选双侧内存演算）、幂等存档、撤销与低余额事件
-  schemas.py    # Pydantic 请求/响应模型（含批量裁决与影响预演）
-  main.py       # FastAPI 路由（4 个管理写接口挂载签名依赖，其余匿名，含 POST /decide-batches 与 POST /policies/impact-preview）
+  database.py   # SQLite 连接、WAL/busy_timeout、BEGIN IMMEDIATE 写事务 / 只读快照事务、建表（含 admin_nonces、decide_batches、reservations/reservation_buckets）与老库迁移（含 baseline 版本补登）
+  quota.py      # 策略 upsert、版本审计/回滚、定时切换登记/取消/到期应用、惰性补充、整组裁决、批量裁决（同刻切换+按序共享桶+全获准才落库+批次幂等存档）、策略影响预演（只读快照+现行/候选双侧内存演算）、配额预占（整组扣占+原命中桶存档+确认/取消/到期惰性返还+同载荷重放）、幂等存档、撤销与低余额事件
+  schemas.py    # Pydantic 请求/响应模型（含批量裁决、影响预演与配额预占）
+  main.py       # FastAPI 路由（4 个管理写接口挂载签名依赖，其余匿名，含 POST /decide-batches、POST /policies/impact-preview 与 POST /reservations 预占四接口）
 tests/
-  test_api.py   # 行为、并发与 HMAC 认证测试（含批量裁决与策略影响预演）
+  test_api.py   # 行为、并发与 HMAC 认证测试（含批量裁决、策略影响预演与配额预占）
 Dockerfile
 docker-compose.yml
 ```

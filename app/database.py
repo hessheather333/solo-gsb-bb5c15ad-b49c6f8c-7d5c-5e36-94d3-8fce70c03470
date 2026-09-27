@@ -150,6 +150,50 @@ BEGIN
     SELECT RAISE(ABORT, 'policy_versions 为只追加的不可变审计表，禁止 DELETE');
 END;
 
+-- 配额预占（reservation）：创建时在同一写事务内对全部命中桶
+-- 「补充 -> 判足 -> 扣减」，充足才记录 pending 与原命中桶（reservation_buckets），
+-- 不足则一个令牌都不扣并记录 rejected。status 生命周期：
+-- pending -> confirmed（确认，仅改状态，不再动余额）
+--        -> cancelled（取消，向原命中桶返还 cost）
+--        -> expired（惰性到期：下一个预占余额写操作/查询在同一事务内
+--                    先把到期 pending 批量转为 expired 并向原桶返还）。
+-- rejected 为终态（创建即被拒绝）。无后台任务，到期完全由写事务惰性驱动；
+-- expires_at 为 pending 的到期时刻（创建时刻 + ttl_seconds），rejected 行为 NULL。
+CREATE TABLE IF NOT EXISTS reservations (
+    reservation_id TEXT PRIMARY KEY,
+    payload_hash   TEXT NOT NULL,
+    payload_json   TEXT NOT NULL,
+    tenant_id      TEXT NOT NULL DEFAULT '',
+    route_id       TEXT NOT NULL DEFAULT '',
+    cost           REAL NOT NULL CHECK (cost > 0),
+    ttl_seconds    INTEGER NOT NULL CHECK (ttl_seconds BETWEEN 1 AND 300),
+    status         TEXT NOT NULL
+                   CHECK (status IN
+                          ('pending', 'confirmed', 'cancelled', 'expired', 'rejected')),
+    created_at     TEXT NOT NULL,
+    expires_at     TEXT,
+    confirmed_at   TEXT,
+    cancelled_at   TEXT,
+    expired_at     TEXT,
+    result_json    TEXT NOT NULL
+) STRICT;
+
+-- 惰性到期清理按 (status, expires_at) 顺序扫描
+CREATE INDEX IF NOT EXISTS idx_reservations_pending_expiry
+ON reservations (status, expires_at);
+
+-- 预占创建获准时保存的「原命中桶」清单（按命中顺序 ord：全局 -> 租户 -> 路由）。
+-- 取消/到期返还只动这些桶；策略可能随后被修改，故只存键、不存容量快照，
+-- 返还时按当时策略补充并以当前容量为上限。
+CREATE TABLE IF NOT EXISTS reservation_buckets (
+    reservation_id TEXT NOT NULL,
+    scope          TEXT NOT NULL,
+    tenant_id      TEXT NOT NULL DEFAULT '',
+    route_id       TEXT NOT NULL DEFAULT '',
+    ord            INTEGER NOT NULL,
+    PRIMARY KEY (reservation_id, scope, tenant_id, route_id)
+) STRICT;
+
 -- 管理写接口（PUT /policies、POST /policies/rollback、
 -- POST /policy-changes、DELETE /policy-changes/{id}）的 HMAC 防重放 nonce。
 -- 与 key_id 联合唯一：同一 key 在保留窗口（expires_at，300 秒）内重用 -> 409；
