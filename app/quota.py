@@ -138,6 +138,10 @@ def upsert_policy(
         )
 
     ts = now_utc()
+    # 所有余额写操作先在同一事务内把到期 pending 预占转为 expired 并返还原桶，
+    # 返还的令牌随后与桶上已有余额一起按新容量截断
+    _expire_due_reservations(conn, ts)
+
     old = conn.execute(
         "SELECT capacity, refill_rate FROM policies "
         "WHERE scope=? AND tenant_id=? AND route_id=?",
@@ -344,6 +348,9 @@ def rollback_policy(
     threshold = target["low_balance_threshold"]
 
     ts = now_utc()
+    # 余额写操作：先在同一事务内把到期 pending 预占转为 expired 并返还，
+    # 随后桶按当前策略补充时即可计入返还的令牌，再按目标容量截断
+    _expire_due_reservations(conn, ts)
     # 已有桶：先按当前策略补充到事务时刻，再截断到目标版本容量
     bucket = conn.execute(
         "SELECT balance, updated_at FROM buckets "
@@ -919,6 +926,9 @@ def decide(
     # 0) 在同一裁决事务内先应用所有命中且到期的定时策略变更（无后台任务，
     #    惰性驱动），随后的读策略/读桶看到的必是切换后的完整新状态
     _apply_due_changes(conn, _hit_keys(tenant_id, route_id), now)
+    # 所有余额写操作：先把到期 pending 预占在同一事务内转为 expired 并返还原桶，
+    # 随后的补充/判足/扣减看到的必是返还后的余额
+    _expire_due_reservations(conn, now)
 
     # 1) 幂等：request_id 已存在时，载荷一致则重放，冲突则 409
     existing = conn.execute(
@@ -1193,6 +1203,9 @@ def decide_batch(
             if key not in hit_keys:
                 hit_keys.append(key)
     _apply_due_changes(conn, hit_keys, now)
+    # 余额写操作：同刻先把到期 pending 预占转为 expired 并返还；整批随后失败时
+    # 本事务整体回滚（到期转换也一并回滚），与到期切换保持 pending 同一规则
+    _expire_due_reservations(conn, now)
 
     # 共享桶状态缓存：同一桶被多个条目命中时，余额沿数组顺序传递
     states: dict[tuple[str, str, str], dict[str, Any]] = {}
@@ -1719,6 +1732,8 @@ def revoke(conn: sqlite3.Connection, request_id: str) -> tuple[dict[str, Any], b
     # 与裁决相同：先在本事务内应用命中且到期的定时变更，再补回令牌，
     # 避免撤销用旧策略把桶时间锚点推过 effective_at 而重复计息
     _apply_due_changes(conn, keys, now)
+    # 余额写操作：先把到期 pending 预占转为 expired 并返还原桶，再补回本裁决
+    _expire_due_reservations(conn, now)
 
     refunded_buckets: list[dict[str, Any]] = []
     for scope, tenant, route in keys:
@@ -1795,3 +1810,427 @@ def list_events(
         }
         for r in rows
     ]
+
+
+# ------------------------------------------------------------ 配额预占（reservation）
+
+
+_RESERVATION_COLS = (
+    "reservation_id, payload_hash, status, tenant_id, route_id, cost, "
+    "ttl_seconds, created_at, expire_at, confirmed_at, cancelled_at, "
+    "expired_at, buckets_json"
+)
+
+
+def _reservation_bucket_keys(row: sqlite3.Row) -> list[tuple[str, str, str]]:
+    """读取创建预占时保存的原命中桶键快照（全局 -> 租户 -> 路由顺序）。"""
+    return [
+        (scope, tenant, route)
+        for scope, tenant, route in json.loads(row["buckets_json"])
+    ]
+
+
+def _live_bucket_snapshot(
+    conn: sqlite3.Connection,
+    keys: list[tuple[str, str, str]],
+    now: datetime,
+) -> list[dict[str, Any]]:
+    """按当前策略与当前时刻，对一组桶键返回补充后的实时余额快照（只读不落库）。"""
+    out: list[dict[str, Any]] = []
+    for scope, tenant, route in keys:
+        pol = conn.execute(
+            "SELECT capacity, refill_rate FROM policies "
+            "WHERE scope=? AND tenant_id=? AND route_id=?",
+            (scope, tenant, route),
+        ).fetchone()
+        if pol is None:
+            continue  # 防御：当前版本不支持删除策略
+        b = conn.execute(
+            "SELECT balance, updated_at FROM buckets "
+            "WHERE scope=? AND tenant_id=? AND route_id=?",
+            (scope, tenant, route),
+        ).fetchone()
+        if b is None:
+            balance = float(pol["capacity"])
+        else:
+            balance = _refill(
+                b["balance"], b["updated_at"],
+                pol["capacity"], pol["refill_rate"], now,
+            )
+        out.append(
+            _bucket_out(
+                scope, tenant, route,
+                pol["capacity"], pol["refill_rate"], balance,
+            )
+        )
+    return out
+
+
+def _reservation_out(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    *,
+    replayed: bool = False,
+    now: Optional[datetime] = None,
+) -> dict[str, Any]:
+    ts = now or now_utc()
+    return {
+        "reservation_id": row["reservation_id"],
+        "status": row["status"],
+        "allowed": row["status"] != "rejected",
+        "tenant_id": row["tenant_id"] or None,
+        "route_id": row["route_id"] or None,
+        "cost": float(row["cost"]),
+        "ttl_seconds": int(row["ttl_seconds"]),
+        "created_at": row["created_at"],
+        "expire_at": row["expire_at"],
+        "confirmed_at": row["confirmed_at"],
+        "cancelled_at": row["cancelled_at"],
+        "expired_at": row["expired_at"],
+        "replayed": bool(replayed),
+        "buckets": _live_bucket_snapshot(
+            conn, _reservation_bucket_keys(row), ts
+        ),
+    }
+
+
+def _refund_to_buckets(
+    conn: sqlite3.Connection,
+    keys: list[tuple[str, str, str]],
+    cost: float,
+    now: datetime,
+) -> None:
+    """向给定的原命中桶返还 cost：先应用这些桶到期的定时切换并按当前策略
+    补充，再加 cost，最终不超过当前容量（与撤销返还同一套规则）。
+
+    不产生 low_balance 事件（事件只在获准裁决的扣减事务内写入）。
+    """
+    _apply_due_changes(conn, keys, now)
+    now_iso = iso(now)
+    for scope, tenant, route in keys:
+        pol = conn.execute(
+            "SELECT capacity, refill_rate FROM policies "
+            "WHERE scope=? AND tenant_id=? AND route_id=?",
+            (scope, tenant, route),
+        ).fetchone()
+        b = conn.execute(
+            "SELECT balance, updated_at FROM buckets "
+            "WHERE scope=? AND tenant_id=? AND route_id=?",
+            (scope, tenant, route),
+        ).fetchone()
+        if pol is None or b is None:
+            # 防御：策略/桶均不支持删除，正常流程中预占创建时桶必然已存在
+            continue
+        # 先按当前补充/定时切换规则计息，再补回 cost，并以当前容量为上限
+        balance = _refill(
+            b["balance"], b["updated_at"],
+            pol["capacity"], pol["refill_rate"], now,
+        )
+        balance = min(float(pol["capacity"]), balance + float(cost))
+        conn.execute(
+            "UPDATE buckets SET balance=?, updated_at=? "
+            "WHERE scope=? AND tenant_id=? AND route_id=?",
+            (balance, now_iso, scope, tenant, route),
+        )
+
+
+def _expire_one_if_due(
+    conn: sqlite3.Connection, reservation_id: str, now: datetime
+) -> bool:
+    """若指定预占为 pending 且 expire_at <= now，在当前事务内转为 expired
+    并向原桶返还；返回是否发生了转换。
+
+    确认/取消与到期竞争时，以事务时刻 now 为唯一裁决依据：到期优先——
+    本检查一旦把行转成 expired，随后的确认/取消即返回 409。
+    """
+    row = conn.execute(
+        f"SELECT {_RESERVATION_COLS} FROM reservations WHERE reservation_id=?",
+        (reservation_id,),
+    ).fetchone()
+    if row is None or row["status"] != "pending" or row["expire_at"] > iso(now):
+        return False
+    cur = conn.execute(
+        "UPDATE reservations SET status='expired', expired_at=? "
+        "WHERE reservation_id=? AND status='pending' AND expire_at <= ?",
+        (iso(now), reservation_id, iso(now)),
+    )
+    if cur.rowcount == 0:
+        return False
+    _refund_to_buckets(conn, _reservation_bucket_keys(row), float(row["cost"]), now)
+    return True
+
+
+def _expire_due_reservations(conn: sqlite3.Connection, now: datetime) -> int:
+    """在当前写事务内把全部到期 pending 预占转为 expired 并向各自原桶返还。
+
+    「所有余额写操作」在动桶之前调用本函数：预占不设后台任务，到期完全由
+    裁决/撤销/策略更新/预占自身操作在同一 BEGIN IMMEDIATE 事务内惰性推进，
+    到期转换、返还与随后的余额读改写原子完成，不会漏还或重复返还。
+    """
+    now_iso = iso(now)
+    rows = conn.execute(
+        f"SELECT {_RESERVATION_COLS} FROM reservations "
+        "WHERE status='pending' AND expire_at <= ? ORDER BY expire_at, rowid",
+        (now_iso,),
+    ).fetchall()
+    count = 0
+    for row in rows:
+        cur = conn.execute(
+            "UPDATE reservations SET status='expired', expired_at=? "
+            "WHERE reservation_id=? AND status='pending' AND expire_at <= ?",
+            (now_iso, row["reservation_id"], now_iso),
+        )
+        if cur.rowcount == 0:
+            continue
+        _refund_to_buckets(
+            conn, _reservation_bucket_keys(row), float(row["cost"]), now
+        )
+        count += 1
+    return count
+
+
+def create_reservation(
+    conn: sqlite3.Connection,
+    *,
+    reservation_id: str,
+    tenant_id: Optional[str],
+    route_id: Optional[str],
+    cost: float,
+    ttl_seconds: int,
+) -> dict[str, Any]:
+    """创建配额预占，返回可直接响应的结果。
+
+    全部命中桶在同一事务、同一时刻下先补充（含到期定时切换）再判足：
+      - 都充足：所有命中桶统一预扣 cost，命中桶键快照存档，状态为 pending；
+      - 任一不足：一个都不扣，预占以 rejected 终态存档（拒绝结果可重放）。
+    动桶之前先清扫全局到期 pending 预占并返还。同 reservation_id 同载荷
+    （tenant_id / route_id / cost / ttl_seconds）重放原结果，异载荷 409。
+    """
+    if cost <= 0:
+        raise HTTPException(422, "cost 必须为正数")
+    if route_id and not tenant_id:
+        raise HTTPException(422, "提供 route_id 时必须同时提供 tenant_id")
+    if not 1 <= int(ttl_seconds) <= 300:
+        raise HTTPException(422, "ttl_seconds 必须在 1 到 300 秒之间")
+
+    now = now_utc()
+    _apply_due_changes(conn, _hit_keys(tenant_id, route_id), now)
+    _expire_due_reservations(conn, now)
+
+    payload = {
+        "tenant_id": tenant_id or None,
+        "route_id": route_id or None,
+        "cost": float(cost),
+        "ttl_seconds": int(ttl_seconds),
+    }
+    digest = payload_hash(payload)
+
+    existing = conn.execute(
+        f"SELECT {_RESERVATION_COLS} FROM reservations WHERE reservation_id=?",
+        (reservation_id,),
+    ).fetchone()
+    if existing is not None:
+        if existing["payload_hash"] != digest:
+            raise HTTPException(
+                409,
+                f"reservation_id={reservation_id!r} 已存在但预占载荷不一致，拒绝重放",
+            )
+        return _reservation_out(conn, existing, replayed=True, now=now)
+
+    levels = _load_policy_levels_batch(conn, tenant_id, route_id)
+    if not levels:
+        raise HTTPException(404, "没有任何命中的配额策略（请先配置至少一层策略）")
+
+    states: list[dict[str, Any]] = []
+    for scope, tenant, route, pol in levels:
+        row = conn.execute(
+            "SELECT balance, updated_at FROM buckets "
+            "WHERE scope=? AND tenant_id=? AND route_id=?",
+            (scope, tenant, route),
+        ).fetchone()
+        if row is None:
+            balance = float(pol["capacity"])
+            conn.execute(
+                "INSERT INTO buckets (scope, tenant_id, route_id, balance, updated_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (scope, tenant, route, balance, iso(now)),
+            )
+        else:
+            balance = _refill(
+                row["balance"], row["updated_at"],
+                pol["capacity"], pol["refill_rate"], now,
+            )
+        states.append(
+            {
+                "scope": scope, "tenant": tenant, "route": route,
+                "capacity": float(pol["capacity"]),
+                "refill_rate": float(pol["refill_rate"]),
+                "balance": balance,
+            }
+        )
+
+    allowed = all(s["balance"] + 1e-12 >= cost for s in states)
+    now_iso = iso(now)
+    expire_at = iso(now + timedelta(seconds=int(ttl_seconds)))
+    bucket_keys = [[s["scope"], s["tenant"], s["route"]] for s in states]
+
+    if allowed:
+        # 全部充足才统一预扣；预占扣减不写 low_balance 事件
+        for s in states:
+            after = s["balance"] - float(cost)
+            s["balance"] = after
+            conn.execute(
+                "UPDATE buckets SET balance=?, updated_at=? "
+                "WHERE scope=? AND tenant_id=? AND route_id=?",
+                (after, now_iso, s["scope"], s["tenant"], s["route"]),
+            )
+        status = "pending"
+    else:
+        # 任一不足：一个都不扣（时间应得的补充按裁决惯例落库），存档为 rejected
+        for s in states:
+            conn.execute(
+                "UPDATE buckets SET balance=?, updated_at=? "
+                "WHERE scope=? AND tenant_id=? AND route_id=?",
+                (s["balance"], now_iso, s["scope"], s["tenant"], s["route"]),
+            )
+        status = "rejected"
+
+    conn.execute(
+        """
+        INSERT INTO reservations
+            (reservation_id, payload_hash, payload_json, status, tenant_id,
+             route_id, cost, ttl_seconds, created_at, expire_at, confirmed_at,
+             cancelled_at, expired_at, buckets_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?)
+        """,
+        (
+            reservation_id, digest,
+            json.dumps(payload, ensure_ascii=False), status,
+            tenant_id or EMPTY, route_id or EMPTY,
+            float(cost), int(ttl_seconds), now_iso, expire_at,
+            json.dumps(bucket_keys, ensure_ascii=False),
+        ),
+    )
+    row = conn.execute(
+        f"SELECT {_RESERVATION_COLS} FROM reservations WHERE reservation_id=?",
+        (reservation_id,),
+    ).fetchone()
+    return _reservation_out(conn, row, replayed=False, now=now)
+
+
+def confirm_reservation(
+    conn: sqlite3.Connection, reservation_id: str
+) -> dict[str, Any]:
+    """确认预占：pending -> confirmed，仅翻转状态，不再扣减任何余额。
+
+    确认与到期竞争时以事务内时间为准、到期优先：若 expire_at 已到，先在同一
+    事务内转为 expired 并返还，再返回 409。
+    重复确认已 confirmed 的预占幂等（不改变余额）；
+    cancelled / expired / rejected 上的确认返回 409；未知 ID 返回 404。
+    """
+    now = now_utc()
+    if _expire_one_if_due(conn, reservation_id, now):
+        raise HTTPException(
+            409, f"reservation_id={reservation_id!r} 已到期（expired），无法确认"
+        )
+    row = conn.execute(
+        f"SELECT {_RESERVATION_COLS} FROM reservations WHERE reservation_id=?",
+        (reservation_id,),
+    ).fetchone()
+    if row is None:
+        raise HTTPException(404, f"reservation_id={reservation_id!r} 不存在")
+    if row["status"] == "confirmed":
+        return _reservation_out(conn, row, replayed=True, now=now)
+    if row["status"] != "pending":
+        raise HTTPException(
+            409,
+            f"reservation_id={reservation_id!r} 当前状态为 {row['status']!r}，"
+            "只有 pending 预占可以确认",
+        )
+    now_iso = iso(now)
+    cur = conn.execute(
+        "UPDATE reservations SET status='confirmed', confirmed_at=? "
+        "WHERE reservation_id=? AND status='pending' AND expire_at > ?",
+        (now_iso, reservation_id, now_iso),
+    )
+    if cur.rowcount == 0:
+        # 并发兜底：本事务持有写锁，期间无其他写者能改此行，理论上不可达
+        raise HTTPException(
+            409, f"reservation_id={reservation_id!r} 已到期（expired），无法确认"
+        )
+    row = conn.execute(
+        f"SELECT {_RESERVATION_COLS} FROM reservations WHERE reservation_id=?",
+        (reservation_id,),
+    ).fetchone()
+    return _reservation_out(conn, row, replayed=False, now=now)
+
+
+def cancel_reservation(
+    conn: sqlite3.Connection, reservation_id: str
+) -> dict[str, Any]:
+    """取消预占：pending -> cancelled，并在同一事务内向原命中桶返还 cost。
+
+    返还沿用当前补充与定时策略切换规则（先计息/切换，再加 cost），最终余额
+    不超过桶当前容量。动桶前先做全局到期清扫：本预占若已到期会先变 expired
+    （且已返还）再返回 409——到期优先。
+    重复取消已 cancelled 的预占幂等（不再次返还、不改变余额）；
+    confirmed / expired / rejected 上的取消返回 409；未知 ID 返回 404。
+    """
+    now = now_utc()
+    # 余额写操作：先把所有到期 pending 预占（可能含本预占）转为 expired 并返还
+    _expire_due_reservations(conn, now)
+
+    row = conn.execute(
+        f"SELECT {_RESERVATION_COLS} FROM reservations WHERE reservation_id=?",
+        (reservation_id,),
+    ).fetchone()
+    if row is None:
+        raise HTTPException(404, f"reservation_id={reservation_id!r} 不存在")
+    if row["status"] == "cancelled":
+        return _reservation_out(conn, row, replayed=True, now=now)
+    if row["status"] != "pending":
+        raise HTTPException(
+            409,
+            f"reservation_id={reservation_id!r} 当前状态为 {row['status']!r}，"
+            "只有 pending 预占可以取消",
+        )
+
+    now_iso = iso(now)
+    cur = conn.execute(
+        "UPDATE reservations SET status='cancelled', cancelled_at=? "
+        "WHERE reservation_id=? AND status='pending' AND expire_at > ?",
+        (now_iso, reservation_id, now_iso),
+    )
+    if cur.rowcount == 0:
+        # 事务开头的全局清扫之后不可能再到期；防御性 409
+        raise HTTPException(
+            409, f"reservation_id={reservation_id!r} 已到期（expired），无法取消"
+        )
+    _refund_to_buckets(
+        conn, _reservation_bucket_keys(row), float(row["cost"]), now
+    )
+    row = conn.execute(
+        f"SELECT {_RESERVATION_COLS} FROM reservations WHERE reservation_id=?",
+        (reservation_id,),
+    ).fetchone()
+    return _reservation_out(conn, row, replayed=False, now=now)
+
+
+def get_reservation(
+    conn: sqlite3.Connection, reservation_id: str
+) -> dict[str, Any]:
+    """查询预占状态及到期时间；若该预占恰好到期，先在同一事务内清理为
+    expired 并向原桶返还（惰性推进），随后返回 expired 终态。
+
+    只处理被查询的这一条，不做全局清扫（GET 不触碰其他桶/预占）。
+    终态行可反复查询，重复调用不改变余额。未知 ID 返回 404。
+    """
+    now = now_utc()
+    _expire_one_if_due(conn, reservation_id, now)
+    row = conn.execute(
+        f"SELECT {_RESERVATION_COLS} FROM reservations WHERE reservation_id=?",
+        (reservation_id,),
+    ).fetchone()
+    if row is None:
+        raise HTTPException(404, f"reservation_id={reservation_id!r} 不存在")
+    return _reservation_out(conn, row, replayed=False, now=now)

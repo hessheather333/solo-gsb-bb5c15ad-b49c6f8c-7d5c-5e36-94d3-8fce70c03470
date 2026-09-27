@@ -150,6 +150,40 @@ BEGIN
     SELECT RAISE(ABORT, 'policy_versions 为只追加的不可变审计表，禁止 DELETE');
 END;
 
+-- 配额预占（reservation）：创建时在同一写事务内对全部命中桶预扣 cost，
+-- 并把命中桶键快照存入 buckets_json，供取消/到期按原桶返还。
+-- status 生命周期：
+--   pending   -> confirmed（确认，仅状态翻转，余额不变）
+--              -> cancelled（取消，向原命中桶返还 cost）
+--              -> expired（到期未确认，惰性转为 expired 并向原桶返还）
+--   rejected  为创建即拒绝的终态（余额未扣），可同载荷重放、不可确认/取消
+-- 没有后台任务：到期 pending 由下一次余额写操作（或该预占自身的确认/查询）
+-- 在同一 BEGIN IMMEDIATE 事务内惰性转 expired 并返还。
+CREATE TABLE IF NOT EXISTS reservations (
+    reservation_id TEXT PRIMARY KEY,
+    payload_hash   TEXT NOT NULL,
+    payload_json   TEXT NOT NULL,
+    status         TEXT NOT NULL
+                   CHECK (status IN ('pending', 'confirmed', 'cancelled',
+                                     'expired', 'rejected')),
+    tenant_id      TEXT NOT NULL DEFAULT '',
+    route_id       TEXT NOT NULL DEFAULT '',
+    cost           REAL NOT NULL CHECK (cost > 0),
+    ttl_seconds    INTEGER NOT NULL CHECK (ttl_seconds BETWEEN 1 AND 300),
+    created_at     TEXT NOT NULL,
+    expire_at      TEXT NOT NULL,
+    confirmed_at   TEXT,
+    cancelled_at   TEXT,
+    expired_at     TEXT,
+    -- 创建时命中桶键列表的 JSON（[["global","",""], ...]），返还时按此定位原桶
+    buckets_json   TEXT NOT NULL
+) STRICT;
+
+-- 到期清扫只扫描 pending 行（部分索引），expire_at 与 ISO 8601 UTC 文本可直接字典序比较
+CREATE INDEX IF NOT EXISTS idx_reservations_due
+ON reservations (expire_at)
+WHERE status = 'pending';
+
 -- 管理写接口（PUT /policies、POST /policies/rollback、
 -- POST /policy-changes、DELETE /policy-changes/{id}）的 HMAC 防重放 nonce。
 -- 与 key_id 联合唯一：同一 key 在保留窗口（expires_at，300 秒）内重用 -> 409；

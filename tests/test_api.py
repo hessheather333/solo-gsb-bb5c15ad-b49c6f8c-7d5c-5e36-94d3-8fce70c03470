@@ -2091,3 +2091,390 @@ def test_impact_preview_remains_anonymous(client):
         },
     )
     assert r.status_code == 200
+
+
+# ============================================================ 配额预占
+
+
+class _FakeClock:
+    """可控的 UTC 时钟：替换 quota.now_utc 后，预占到期判定完全由测试驱动。"""
+
+    def __init__(self, start: datetime):
+        self.t = start
+
+    def now(self) -> datetime:
+        return self.t
+
+    def advance(self, seconds: float) -> None:
+        self.t += timedelta(seconds=seconds)
+
+
+@pytest.fixture()
+def clock(client, monkeypatch) -> _FakeClock:
+    from app import quota
+
+    clk = _FakeClock(datetime(2026, 9, 27, 12, 0, 0, tzinfo=timezone.utc))
+    monkeypatch.setattr(quota, "now_utc", clk.now)
+    return clk
+
+
+def _global_balance(client) -> float:
+    rows = client.get("/buckets").json()
+    return next(b["balance"] for b in rows if b["scope"] == "global")
+
+
+def _reserve(client, reservation_id, cost, *, ttl=60, tenant=None, route=None):
+    return client.post(
+        "/reservations",
+        json={
+            "reservation_id": reservation_id,
+            "tenant_id": tenant,
+            "route_id": route,
+            "cost": cost,
+            "ttl_seconds": ttl,
+        },
+    )
+
+
+def test_reservation_deducts_all_hit_buckets_and_saves_origin(client, clock):
+    put_policy(client, "global", 10, 0)
+    put_policy(client, "tenant", 6, 0, tenant="t1")
+    put_policy(client, "route", 4, 0, tenant="t1", route="/r1")
+
+    r = _reserve(client, "rsv-1", 3, ttl=60, tenant="t1", route="/r1")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "pending"
+    assert body["allowed"] is True
+    assert body["replayed"] is False
+    assert body["ttl_seconds"] == 60
+    assert body["expire_at"] == "2026-09-27T12:01:00Z"
+    assert [b["scope"] for b in body["buckets"]] == ["global", "tenant", "route"]
+    assert [b["balance"] for b in body["buckets"]] == [7.0, 3.0, 1.0]
+
+    buckets = {b["scope"]: b["balance"] for b in client.get("/buckets").json()}
+    assert buckets["global"] == 7.0
+    assert buckets["tenant"] == 3.0
+    assert buckets["route"] == 1.0
+
+
+def test_reservation_insufficient_deducts_nothing_and_is_rejected(client, clock):
+    put_policy(client, "global", 10, 0)
+    put_policy(client, "tenant", 2, 0, tenant="t1")
+
+    r = _reserve(client, "rsv-x", 3, ttl=60, tenant="t1")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "rejected"
+    assert body["allowed"] is False
+    # 全部不扣：全局 10 与租户 2 均不变
+    assert [b["balance"] for b in body["buckets"]] == [10.0, 2.0]
+    assert client.get("/buckets").json()[0]["balance"] == 10.0
+
+    # rejected 是终态：不能确认也不能取消
+    assert client.post("/reservations/rsv-x/confirm").status_code == 409
+    assert client.post("/reservations/rsv-x/cancel").status_code == 409
+
+
+def test_reservation_replay_same_payload_and_conflict_409(client, clock):
+    put_policy(client, "global", 10, 0)
+    b1 = _reserve(client, "rsv-r", 3, ttl=60).json()
+    assert b1["replayed"] is False
+
+    b2 = _reserve(client, "rsv-r", 3, ttl=60).json()
+    assert b2["replayed"] is True
+    assert b2["status"] == "pending"
+    assert _global_balance(client) == 7.0  # 重放不重复扣减
+
+    # 异载荷（cost / ttl / tenant / route 任一不同）-> 409
+    assert _reserve(client, "rsv-r", 4, ttl=60).status_code == 409
+    assert _reserve(client, "rsv-r", 3, ttl=61).status_code == 409
+
+    # rejected 预占同样支持同载荷重放、异载荷 409
+    _reserve(client, "rsv-z", 999, ttl=10)
+    rep = _reserve(client, "rsv-z", 999, ttl=10).json()
+    assert rep["status"] == "rejected"
+    assert rep["replayed"] is True
+    assert _reserve(client, "rsv-z", 998, ttl=10).status_code == 409
+
+
+def test_reservation_validation_and_missing_policy(client, clock):
+    # 尚无任何策略：载荷校验（422）先于策略命中查找
+    # cost 非正
+    assert client.post(
+        "/reservations",
+        json={"reservation_id": "v1", "cost": 0, "ttl_seconds": 60},
+    ).status_code == 422
+    # ttl 越界
+    assert client.post(
+        "/reservations",
+        json={"reservation_id": "v2", "cost": 1, "ttl_seconds": 0},
+    ).status_code == 422
+    assert client.post(
+        "/reservations",
+        json={"reservation_id": "v3", "cost": 1, "ttl_seconds": 301},
+    ).status_code == 422
+    # 只给 route_id 不给 tenant_id
+    assert client.post(
+        "/reservations",
+        json={"reservation_id": "v4", "route_id": "/r", "cost": 1, "ttl_seconds": 60},
+    ).status_code == 422
+
+    # 无任何命中策略 -> 404，且不留存档
+    r = _reserve(client, "v5", 1, ttl=60, tenant="nope")
+    assert r.status_code == 404
+    assert client.get("/reservations/v5").status_code == 404
+
+
+def test_confirm_only_transitions_without_deduction(client, clock):
+    put_policy(client, "global", 10, 0)
+    _reserve(client, "rsv-c", 3, ttl=60)
+    assert _global_balance(client) == 7.0
+
+    r = client.post("/reservations/rsv-c/confirm")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "confirmed"
+    assert body["confirmed_at"] == "2026-09-27T12:00:00Z"
+    assert _global_balance(client) == 7.0  # 确认不再扣减
+
+    # 重复确认幂等，不改变余额
+    again = client.post("/reservations/rsv-c/confirm").json()
+    assert again["status"] == "confirmed"
+    assert again["replayed"] is True
+    assert _global_balance(client) == 7.0
+
+    # 已确认不可取消（其他终态转换 409）
+    assert client.post("/reservations/rsv-c/cancel").status_code == 409
+    # 已确认的预占即使时钟走过 expire_at 也保持 confirmed，不返还
+    clock.advance(120)
+    assert client.get("/reservations/rsv-c").json()["status"] == "confirmed"
+    assert _global_balance(client) == 7.0
+
+
+def test_cancel_refunds_original_buckets_capped_at_capacity(client, clock):
+    put_policy(client, "global", 10, 10)  # 10/s，取消时先补充再返还
+    put_policy(client, "tenant", 6, 0, tenant="t1")
+    _reserve(client, "rsv-k", 3, ttl=60, tenant="t1")
+    assert _global_balance(client) == 7.0
+
+    clock.advance(1)  # 全局桶时间补充：7 -> min(10, 7+10) = 10
+    r = client.post("/reservations/rsv-k/cancel")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "cancelled"
+    assert body["cancelled_at"] == "2026-09-27T12:00:01Z"
+    buckets = {b["scope"]: b["balance"] for b in body["buckets"]}
+    assert buckets["global"] == 10.0   # 10 + 3 超过容量，截断不超过当前容量
+    assert buckets["tenant"] == 6.0    # 3 + 3 = 6（租户速率 0 无补充，恰好回到容量）
+
+    # 重复取消幂等：不再次返还
+    again = client.post("/reservations/rsv-k/cancel").json()
+    assert again["status"] == "cancelled"
+    assert again["replayed"] is True
+    assert _global_balance(client) == 10.0
+    tenant_bal = next(
+        b["balance"] for b in client.get("/buckets").json()
+        if b["scope"] == "tenant"
+    )
+    assert tenant_bal == 6.0
+
+    # 已取消不可确认
+    assert client.post("/reservations/rsv-k/confirm").status_code == 409
+
+
+def test_expiry_wins_over_confirm_at_boundary(client, clock):
+    put_policy(client, "global", 10, 0)
+    _reserve(client, "rsv-e", 3, ttl=60)
+    assert _global_balance(client) == 7.0
+
+    # 恰好到期时刻：expire_at <= now，到期优先于确认
+    clock.advance(60)
+    r = client.post("/reservations/rsv-e/confirm")
+    assert r.status_code == 409
+    body = client.get("/reservations/rsv-e").json()
+    assert body["status"] == "expired"
+    assert body["expired_at"] == "2026-09-27T12:01:00Z"
+    assert _global_balance(client) == 10.0  # 到期已返还
+
+    # 到期后确认/取消均 409；重复查询终态不变、余额不变
+    assert client.post("/reservations/rsv-e/confirm").status_code == 409
+    assert client.post("/reservations/rsv-e/cancel").status_code == 409
+    again = client.get("/reservations/rsv-e").json()
+    assert again["status"] == "expired"
+    assert _global_balance(client) == 10.0
+
+
+def test_cancel_at_exact_expiry_goes_to_expired_not_cancelled(client, clock):
+    put_policy(client, "global", 10, 0)
+    _reserve(client, "rsv-ce", 4, ttl=30)
+    clock.advance(30)
+    # 到期时刻取消：全局清扫先把它转 expired（已返还），随后 409
+    assert client.post("/reservations/rsv-ce/cancel").status_code == 409
+    body = client.get("/reservations/rsv-ce").json()
+    assert body["status"] == "expired"
+    assert body["cancelled_at"] is None
+    assert _global_balance(client) == 10.0
+
+
+def test_get_reservation_returns_status_and_expiry_and_cleans_due(client, clock):
+    put_policy(client, "global", 10, 0)
+    _reserve(client, "rsv-g", 3, ttl=60)
+
+    before = client.get("/reservations/rsv-g").json()
+    assert before["status"] == "pending"
+    assert before["expire_at"] == "2026-09-27T12:01:00Z"
+    assert before["expired_at"] is None
+    assert _global_balance(client) == 7.0  # 未到期查询不动余额
+
+    # 到期后查询触发该预占自身的惰性清理：转 expired 并返还
+    clock.advance(61)
+    after = client.get("/reservations/rsv-g").json()
+    assert after["status"] == "expired"
+    # expired_at 是惰性转换实际发生的事务时刻（与 policy_changes.applied_at 同语义）
+    assert after["expired_at"] == "2026-09-27T12:01:01Z"
+    assert _global_balance(client) == 10.0
+
+    assert client.get("/reservations/missing").status_code == 404
+
+
+def test_balance_write_sweeps_all_due_pending_before_deducting(client, clock):
+    put_policy(client, "global", 10, 0)
+    _reserve(client, "rsv-1", 3, ttl=10)
+    _reserve(client, "rsv-2", 2, ttl=20)
+    assert _global_balance(client) == 5.0
+
+    clock.advance(15)  # rsv-1 到期，rsv-2 未到期
+    # 裁决是余额写操作：事务内先把 rsv-1 转 expired 并返还 3 -> 8，再扣 4
+    r = client.post("/decide", json={"request_id": "d1", "cost": 4})
+    assert r.json()["allowed"] is True
+    assert _global_balance(client) == 4.0
+    assert client.get("/reservations/rsv-1").json()["status"] == "expired"
+    assert client.get("/reservations/rsv-2").json()["status"] == "pending"
+
+    # rsv-2 到期后，撤销裁决同样先清扫返还 2（4 -> 6），再补裁决 cost 4 -> 10
+    clock.advance(10)
+    client.post("/decide/d1/revoke")
+    assert _global_balance(client) == 10.0
+    assert client.get("/reservations/rsv-2").json()["status"] == "expired"
+
+
+def test_due_pending_blocks_new_reservation_until_swept(client, clock):
+    put_policy(client, "global", 5, 0)
+    _reserve(client, "rsv-old", 5, ttl=10)
+    assert _global_balance(client) == 0.0
+    # 未到期：余额为 0，新预占被拒
+    assert _reserve(client, "rsv-new", 1, ttl=10).json()["status"] == "rejected"
+    # 到期后的余额写操作先返还 5，新预占即可成功扣 1
+    clock.advance(11)
+    body = _reserve(client, "rsv-new2", 1, ttl=10).json()
+    assert body["status"] == "pending"
+    assert _global_balance(client) == 4.0
+
+
+def test_expired_reservation_replay_does_not_refund_again(client, clock):
+    put_policy(client, "global", 10, 0)
+    _reserve(client, "rsv-rr", 3, ttl=10)
+    clock.advance(11)
+    assert client.get("/reservations/rsv-rr").json()["status"] == "expired"
+    assert _global_balance(client) == 10.0
+    # 同载荷重放只返回 expired 存档，不再返还、状态不再变
+    rep = _reserve(client, "rsv-rr", 3, ttl=10)
+    assert rep.status_code == 200
+    assert rep.json()["status"] == "expired"
+    assert rep.json()["replayed"] is True
+    assert _global_balance(client) == 10.0
+
+
+def test_reservation_refund_uses_scheduled_switch_rules(client, clock):
+    # 旧策略容量 10、速率 0；预占 4 后余额 6。
+    # 10 秒后容量切换为 20：先按旧率补充（6），按比例换算 6/10*20=12，
+    # 返还 4 -> 16（不超过新容量 20）。
+    from app import quota
+
+    put_policy(client, "global", 10, 0)
+    _reserve(client, "rsv-sw", 4, ttl=100)
+    assert _global_balance(client) == 6.0
+
+    # 在当前时刻（12:00:00）登记 12:00:10 生效的切换（effective_at 必须严格在未来）
+    admin_call(
+        client, "POST", "/policy-changes",
+        {
+            "change_id": "chg-sw", "scope": "global",
+            "capacity": 20, "refill_rate": 0,
+            "effective_at": _iso(datetime(2026, 9, 27, 12, 0, 10, tzinfo=timezone.utc)),
+        },
+    )
+    clock.advance(10)
+    # 取消是余额写操作：事务内先应用到期切换，再按当前规则返还
+    body = client.post("/reservations/rsv-sw/cancel").json()
+    assert body["status"] == "cancelled"
+    assert body["buckets"][0]["capacity"] == 20.0
+    assert body["buckets"][0]["balance"] == 16.0
+
+
+def test_reservation_rejected_when_bucket_missing_after_switch_shrink(client, clock):
+    # 到期切换把容量缩到 1 并已生效，cost=2 的新预占必被拒（一个都不扣）
+    put_policy(client, "global", 10, 0)
+    _reserve(client, "rsv-shrink", 9, ttl=100)
+    # 在 12:00:00 登记 12:00:05 生效的缩容切换
+    admin_call(
+        client, "POST", "/policy-changes",
+        {
+            "change_id": "chg-shrink", "scope": "global",
+            "capacity": 1, "refill_rate": 0,
+            "effective_at": _iso(datetime(2026, 9, 27, 12, 0, 5, tzinfo=timezone.utc)),
+        },
+    )
+    clock.advance(5)
+    body = _reserve(client, "rsv-after", 2, ttl=10).json()
+    assert body["status"] == "rejected"
+    # 切换换算：旧余额 1/旧容量 10*新容量 1 = 0.1；拒绝不扣
+    assert body["buckets"][0]["capacity"] == 1.0
+    assert body["buckets"][0]["balance"] == pytest.approx(0.1)
+
+
+def test_reservation_apis_remain_anonymous(client):
+    put_policy(client, "global", 10, 0)
+    # 预占四个接口都不带签名头即可访问
+    r = client.post(
+        "/reservations",
+        json={"reservation_id": "anon-1", "cost": 1, "ttl_seconds": 60},
+    )
+    assert r.status_code == 200
+    assert client.post("/reservations/anon-1/confirm").status_code == 200
+    assert client.get("/reservations/anon-1").status_code == 200
+    r2 = client.post(
+        "/reservations",
+        json={"reservation_id": "anon-2", "cost": 1, "ttl_seconds": 60},
+    )
+    assert r2.status_code == 200
+    assert client.post("/reservations/anon-2/cancel").status_code == 200
+
+
+def test_concurrent_reservations_never_oversell(client):
+    # 使用真实时钟与 ttl=300，排除到期清扫干扰；20 线程各预占 1，容量 10
+    put_policy(client, "global", 10, 0)
+    results: list[bool] = []
+    lock = threading.Lock()
+
+    def worker(i: int) -> None:
+        r = client.post(
+            "/reservations",
+            json={
+                "reservation_id": f"c-rsv-{i}",
+                "cost": 1,
+                "ttl_seconds": 300,
+            },
+        )
+        with lock:
+            results.append(r.json()["status"] == "pending")
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(20)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert sum(results) == 10           # 恰好 10 个预占成功
+    assert _global_balance(client) == 0.0

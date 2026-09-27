@@ -257,6 +257,39 @@ class ImpactPreviewOut(BaseModel):
     summary: ImpactPreviewSummaryOut
 
 
+class ReservationIn(BaseModel):
+    reservation_id: str = Field(
+        ..., min_length=1, description="预占幂等键：相同 ID + 相同载荷重放原结果；异载荷 409"
+    )
+    tenant_id: Optional[str] = None
+    route_id: Optional[str] = Field(default=None, description="提供 route_id 时必须带 tenant_id")
+    cost: float = Field(..., gt=0, description="预占令牌数（正数），全部命中桶统一预扣")
+    ttl_seconds: int = Field(
+        ..., ge=1, le=300, description="预占有效期（1～300 秒）；到期未确认自动失效并返还"
+    )
+
+
+class ReservationOut(BaseModel):
+    reservation_id: str
+    status: Literal["pending", "confirmed", "cancelled", "expired", "rejected"]
+    allowed: bool = Field(
+        ..., description="预占是否成功（status != rejected）；rejected 表示创建时桶不足，未扣余额"
+    )
+    tenant_id: Optional[str]
+    route_id: Optional[str]
+    cost: float
+    ttl_seconds: int
+    created_at: str
+    expire_at: str = Field(..., description="到期时刻（ISO 8601 UTC）；到期未确认自动 expired 并返还")
+    confirmed_at: Optional[str] = None
+    cancelled_at: Optional[str] = None
+    expired_at: Optional[str] = None
+    replayed: bool = False
+    buckets: list[BucketOut] = Field(
+        ..., description="原命中桶按当前策略补充后的实时余额（只读快照）"
+    )
+
+
 class LowBalanceEventOut(BaseModel):
     id: int = Field(..., description="单调递增的事件 id，用作分页游标")
     scope: str
