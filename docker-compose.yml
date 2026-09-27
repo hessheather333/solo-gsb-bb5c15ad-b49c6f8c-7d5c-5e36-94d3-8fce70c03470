@@ -1,0 +1,25 @@
+services:
+  quota-api:
+    build: .
+    image: multi-level-quota-api:latest
+    container_name: multi-level-quota-api
+    ports:
+      - "8000:8000"
+    volumes:
+      - quota-data:/data
+    environment:
+      QUOTA_DB_PATH: /data/quota.db
+      # 管理写接口 HMAC 防重放凭据（生产请务必覆盖为自己的高强度随机值，
+      # 例如：ADMIN_HMAC_SECRET="$(openssl rand -hex 32)"）
+      ADMIN_KEY_ID: ${ADMIN_KEY_ID:-admin-key-1}
+      ADMIN_HMAC_SECRET: ${ADMIN_HMAC_SECRET:-change-me-please-use-openssl-rand-hex-32}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health').status==200 else 1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  quota-data:
